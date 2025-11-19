@@ -1,0 +1,293 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Realtime Fruit Color Detector</title>
+  <style>
+    body { font-family: system-ui, Arial; display:flex; gap:20px; padding:18px; }
+    #left { position:relative; }
+    video, canvas { border-radius:8px; background:#000; }
+    #controls { max-width:360px; }
+    .box { margin-bottom:12px; }
+    #info { margin-top:8px; font-weight:600; }
+    #sample-swatch { width:48px; height:48px; display:inline-block; vertical-align:middle; border:1px solid #ddd; margin-left:8px; }
+    #center-guide { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); border:2px dashed rgba(255,255,255,0.6); width:120px; height:120px; pointer-events:none; border-radius:6px; }
+    .small { font-size:13px; color:#666; }
+    button { padding:8px 12px; border-radius:6px; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div id="left">
+    <video id="video" autoplay playsinline width="640" height="480"></video>
+    <canvas id="overlay" width="640" height="480" style="position:absolute;left:0;top:0"></canvas>
+    <div id="center-guide"></div>
+  </div>
+
+  <div id="controls">
+    <h3>Fruit Color Detector (webcam)</h3>
+    <div class="box">
+      <button id="startBtn">Start Camera</button>
+      <button id="sampleBtn">Sample Center Color</button>
+      <button id="lockBtn">Lock Sample (track)</button>
+      <button id="clearBtn">Clear Sample</button>
+    </div>
+
+    <div class="box small">
+      Tip: Arahkan buah ke kotak tengah lalu klik <b>Sample Center Color</b> untuk memberi tahu warna buah.
+    </div>
+
+    <div class="box">
+      <label>Auto-calc from center: <input id="autoCenter" type="checkbox" checked></label>
+    </div>
+
+    <div class="box">
+      <div>Sample color: <div id="sampleTxt" style="display:inline-block;margin-left:8px">—</div><div id="sample-swatch"></div></div>
+    </div>
+
+    <div class="box">
+      <div id="info">Detected: <span id="detected">—</span></div>
+      <div class="small">H,S,V: <span id="hsv">—</span></div>
+    </div>
+
+    <hr>
+
+    <div class="box small">
+      Lighting affects color. If results look off, increase room light or point a lamp at the fruit.
+    </div>
+  </div>
+
+<script>
+// ------------------ helper functions ------------------
+function rgbToHsv(r,g,b){
+  r/=255; g/=255; b/=255;
+  const mx = Math.max(r,g,b), mn = Math.min(r,g,b);
+  const d = mx - mn;
+  let h=0, s=0, v=mx;
+  s = mx === 0 ? 0 : d/mx;
+  if (d === 0) h = 0;
+  else {
+    if (mx === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h /= 6;
+  }
+  return [ Math.round(h*360), Math.round(s*100), Math.round(v*100) ];
+}
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function distanceHSV(h1,s1,v1,h2,s2,v2){
+  // hue circular distance
+  let dh = Math.min(Math.abs(h1-h2), 360-Math.abs(h1-h2))/180.0; // normalized
+  let ds = (s1-s2)/100.0;
+  let dv = (v1-v2)/100.0;
+  return Math.sqrt(dh*dh + ds*ds + dv*dv);
+}
+
+// quick map of hue -> name (coarse)
+function nameFromHSV(h,s,v){
+  if (v < 15) return "Gelap";
+  if (s < 10 && v > 90) return "Putih / terang";
+  if ((h <= 10) || (h >= 345)) return "Merah";
+  if (h <= 30) return "Oranye/Kuning";
+  if (h <= 55) return "Kuning";
+  if (h <= 140) return "Hijau";
+  if (h <= 200) return "Biru/Tosca";
+  if (h <= 290) return "Ungu";
+  if (h <= 340) return "Magenta / Merah tua";
+  return "Tidak dikenal";
+}
+
+// ------------------ main ------------------
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const startBtn = document.getElementById('startBtn');
+const sampleBtn = document.getElementById('sampleBtn');
+const lockBtn = document.getElementById('lockBtn');
+const clearBtn = document.getElementById('clearBtn');
+const autoCenter = document.getElementById('autoCenter');
+const sampleSwatch = document.getElementById('sample-swatch');
+const sampleTxt = document.getElementById('sampleTxt');
+const detectedEl = document.getElementById('detected');
+const hsvEl = document.getElementById('hsv');
+
+let stream = null;
+let running = false;
+let sampleHSV = null;   // {h,s,v}
+let locked = false;
+
+// size & center crop config
+const W = 640, H = 480;
+overlay.width = W; overlay.height = H;
+video.width = W; video.height = H;
+const CBOX = 60; // half-size of square sample = 60 -> 120x120
+
+async function startCamera(){
+  if (stream) return;
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({video:{width:W, height:H}, audio:false});
+    video.srcObject = stream;
+    await video.play();
+    running = true;
+    requestAnimationFrame(processFrame);
+  }catch(e){
+    alert("Gagal akses kamera: " + e.message);
+  }
+}
+
+function stopCamera(){
+  if (!stream) return;
+  stream.getTracks().forEach(t=>t.stop());
+  stream = null;
+  running = false;
+}
+
+// sample color from center crop
+function sampleCenter(){
+  // draw video frame to temp canvas
+  const tmp = document.createElement('canvas');
+  tmp.width = W; tmp.height = H;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(video, 0, 0, W, H);
+  const cx = Math.floor(W/2), cy = Math.floor(H/2);
+  const size = CBOX;
+  const imgd = tctx.getImageData(cx-size, cy-size, size*2, size*2).data;
+  // compute mean RGB
+  let r=0,g=0,b=0, count=0;
+  for(let i=0;i<imgd.length;i+=4){
+    r += imgd[i]; g += imgd[i+1]; b += imgd[i+2];
+    count++;
+  }
+  r = Math.round(r/count); g = Math.round(g/count); b = Math.round(b/count);
+  const hsv = rgbToHsv(r,g,b);
+  sampleHSV = {h:hsv[0], s:hsv[1], v:hsv[2], r,g,b};
+  locked = false;
+  updateSampleUI();
+}
+
+// update UI
+function updateSampleUI(){
+  if (!sampleHSV){
+    sampleTxt.innerText = "—";
+    sampleSwatch.style.background = "#fff";
+    return;
+  }
+  sampleTxt.innerText = `${sampleHSV.r},${sampleHSV.g},${sampleHSV.b}  →  H:${sampleHSV.h} S:${sampleHSV.s} V:${sampleHSV.v}`;
+  sampleSwatch.style.background = `rgb(${sampleHSV.r},${sampleHSV.g},${sampleHSV.b})`;
+}
+
+// main processing loop
+function processFrame(){
+  if (!running) return;
+  ctx.clearRect(0,0,W,H);
+  ctx.drawImage(video,0,0,W,H);
+
+  // draw center guide (box is in CSS)
+  // compute center sample either auto or locked / sampled
+  const cx = Math.floor(W/2), cy = Math.floor(H/2);
+  const size = CBOX;
+
+  // sample center or use locked sample tracking
+  let curHSV = null;
+  if (autoCenter.checked){
+    // sample center each frame (live)
+    const frame = ctx.getImageData(cx-size, cy-size, size*2, size*2);
+    let r=0,g=0,b=0, count=0;
+    const d = frame.data;
+    for(let i=0;i<d.length;i+=4){
+      r += d[i]; g += d[i+1]; b += d[i+2]; count++;
+    }
+    r = Math.round(r/count); g = Math.round(g/count); b = Math.round(b/count);
+    const hsv = rgbToHsv(r,g,b);
+    curHSV = {h:hsv[0], s:hsv[1], v:hsv[2], r,g,b};
+  }
+
+  // if we have a locked sample color, build a mask to highlight similar pixels
+  if (sampleHSV && locked){
+    // draw mask on overlay by scanning reduced resolution for performance
+    const step = 4; // sampling step
+    const frame = ctx.getImageData(0,0,W,H);
+    const d = frame.data;
+    ctx.fillStyle = "rgba(0,0,0,0.0)";
+    // create an offscreen canvas to show mask
+    const mask = ctx.createImageData(W,H);
+    const md = mask.data;
+    for(let y=0;y<H;y+=step){
+      for(let x=0;x<W;x+=step){
+        const idx = (y*W + x) * 4;
+        const r = d[idx], g = d[idx+1], b = d[idx+2];
+        const hsv = rgbToHsv(r,g,b);
+        const dist = distanceHSV(hsv[0], hsv[1], hsv[2], sampleHSV.h, sampleHSV.s, sampleHSV.v);
+        // threshold (tweakable)
+        if (dist < 0.27){ // smaller = stricter
+          md[idx] = 255; md[idx+1] = 0; md[idx+2] = 0; md[idx+3] = 120; // red overlay
+        } else {
+          md[idx+3] = 0;
+        }
+      }
+    }
+    // draw mask scaled (we drew at W,H but only set stepped pixels)
+    ctx.putImageData(mask,0,0);
+    // optionally compute centroid of matched pixels and draw bounding circle
+    let sumx=0,sumy=0,cnt=0;
+    for(let y=0;y<H;y+=step){
+      for(let x=0;x<W;x+=step){
+        const idx = (y*W + x) * 4;
+        if (mask.data[idx+3] > 0){
+          sumx += x; sumy += y; cnt++;
+        }
+      }
+    }
+    if (cnt>20){
+      const mx = Math.round(sumx / cnt);
+      const my = Math.round(sumy / cnt);
+      ctx.beginPath();
+      ctx.strokeStyle = "lime";
+      ctx.lineWidth = 3;
+      ctx.arc(mx,my, Math.min(120, Math.sqrt(cnt)*1.5), 0, Math.PI*2);
+      ctx.stroke();
+      // sample HSV at centroid area to show detection confidence
+      const area = ctx.getImageData(clamp(mx-10,0,W-1), clamp(my-10,0,H-1), 20, 20);
+      let rr=0,gg=0,bb=0,cc=0;
+      for(let i=0;i<area.data.length;i+=4){
+        rr += area.data[i]; gg += area.data[i+1]; bb += area.data[i+2]; cc++;
+      }
+      if (cc>0){
+        const hh = rgbToHsv(Math.round(rr/cc), Math.round(gg/cc), Math.round(bb/cc));
+        detectedEl.innerText = nameFromHSV(hh[0], hh[1], hh[2]);
+        hsvEl.innerText = `${hh[0]}, ${hh[1]}, ${hh[2]}`;
+      }
+    } else {
+      // fallback: show sample name only
+      detectedEl.innerText = nameFromHSV(sampleHSV.h, sampleHSV.s, sampleHSV.v);
+      hsvEl.innerText = `${sampleHSV.h}, ${sampleHSV.s}, ${sampleHSV.v}`;
+    }
+
+  } else {
+    // no tracking -> show name from center (live)
+    if (curHSV){
+      detectedEl.innerText = nameFromHSV(curHSV.h, curHSV.s, curHSV.v);
+      hsvEl.innerText = `${Math.round(curHSV.h)}, ${Math.round(curHSV.s)}, ${Math.round(curHSV.v)}`;
+    } else {
+      detectedEl.innerText = "—";
+      hsvEl.innerText = "—";
+    }
+  }
+
+  // draw center rectangle and labels
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx-size, cy-size, size*2, size*2);
+
+  requestAnimationFrame(processFrame);
+}
+
+// buttons
+startBtn.onclick = () => startCamera();
+sampleBtn.onclick = () => { sampleCenter(); };
+lockBtn.onclick = () => { if (sampleHSV){ locked = !locked; lockBtn.innerText = locked ? "Unlock" : "Lock Sample (track)"; } };
+clearBtn.onclick = () => { sampleHSV = null; locked = false; lockBtn.innerText = "Lock Sample (track)"; updateSampleUI(); detectedEl.innerText="—"; hsvEl.innerText="—"; };
+
+updateSampleUI();
+</script>
+</body>
+</html>
